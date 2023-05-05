@@ -11,11 +11,11 @@ pub struct Heartbeat {
     pub last_seq_number: u64,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct IdentifyProperties {
-    pub os: &'static str,
-    pub browser: &'static str,
-    pub device: &'static str,
+    pub os: String,
+    pub browser: String,
+    pub device: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -23,7 +23,7 @@ pub struct Identify {
     pub token: String,
     pub properties: IdentifyProperties,
     // STUB: other fields
-    pub intents: u32,
+    pub intents: u64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -63,7 +63,9 @@ pub struct Hello {
 struct RawGatewayEvent<T> {
     op: u32,
     d: T,
+    #[serde(skip_serializing_if = "Option::is_none")]
     s: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     t: Option<String>,
 }
 

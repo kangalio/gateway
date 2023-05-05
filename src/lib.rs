@@ -30,8 +30,7 @@ pub enum ShardCommand {
 
 pub enum ConnectionState {
     WaitingForHello,
-    WaitingForHelloToResume,
-    WaitingForResumedAck,
+    WaitingForResumed,
     Connected,
 }
 
@@ -71,12 +70,19 @@ struct ShardConnection {
 
 impl ShardConnection {
     async fn send(&self, msg: GatewaySendEvent) {
-        self.sender
-            .lock()
-            .await
-            .send(tungstenite::Message::Binary(serde_json::to_vec(&msg).unwrap()))
-            .await
-            .unwrap();
+        let msg = match serde_json::to_string(&msg) {
+            Ok(x) => x,
+            Err(e) => {
+                log::warn!("failed to serialize websocket message: {}", e);
+                return;
+            }
+        };
+
+        log::info!("sending {}", msg);
+
+        if let Err(e) = self.sender.lock().await.send(tungstenite::Message::Text(msg)).await {
+            log::warn!("failed to send websocket message: {}", e);
+        }
     }
 }
 
@@ -85,11 +91,23 @@ pub struct ShardOptions {
     pub gateway_url: String,
     pub token: String,
     pub callback: Box<dyn Fn(ShardEvent) + Send + Sync>,
+    pub identify_properties: IdentifyProperties,
+    pub intents: u64,
 }
 
 impl ShardOptions {
     pub fn new(gateway_url: impl Into<String>, token: impl Into<String>) -> Self {
-        Self { gateway_url: gateway_url.into(), token: token.into(), callback: Box::new(|_| {}) }
+        Self {
+            gateway_url: gateway_url.into(),
+            token: token.into(),
+            callback: Box::new(|_| {}),
+            identify_properties: IdentifyProperties {
+                os: std::env::consts::OS.into(),
+                browser: "serenity".into(),
+                device: "serenity".into(),
+            },
+            intents: 1 << 0 | 1 << 9 | 1 << 15,
+        }
     }
 }
 
@@ -132,6 +150,8 @@ impl Shard {
 }
 
 async fn connect(url: &str) -> Result<ShardConnection, tungstenite::Error> {
+    log::info!("connecting to {}...", url);
+
     let (stream, _connect_response) = tokio_tungstenite::connect_async(url).await?;
     let (ws_sender, ws_receiver) = stream.split();
 
@@ -147,19 +167,26 @@ async fn connect(url: &str) -> Result<ShardConnection, tungstenite::Error> {
 }
 
 async fn reconnect_and_resume(shard: &Shard, connection: &mut ShardConnection) {
-    let gateway_url = match shard.resume_gateway_url.lock().clone() {
-        Some(x) => x,
-        None => {
-            log::warn!("resume_gateway_url is None, falling back to default URL");
-            shard.options.gateway_url.clone()
-        }
+    let (Some(mut gateway_url), Some(session_id)) = (shard.resume_gateway_url.lock().clone(), shard.session_id.lock().clone()) else {
+        log::warn!("resume_gateway_url or session_id is None, cannot resume");
+        reconnect_and_dont_resume(shard, connection).await;
+        return;
     };
 
     let last_seq_number = *connection.last_seq_number.lock();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     *connection = connect(&gateway_url).await.unwrap();
     *connection.last_seq_number.lock() = last_seq_number;
 
-    *shard.state.lock() = ConnectionState::WaitingForHelloToResume;
+    connection
+        .send(GatewaySendEvent::Resume(Resume {
+            token: shard.options.token.clone(),
+            session_id,
+            seq: last_seq_number,
+        }))
+        .await;
+
+    *shard.state.lock() = ConnectionState::WaitingForResumed;
 }
 
 async fn reconnect_and_dont_resume(shard: &Shard, connection: &mut ShardConnection) {
@@ -172,6 +199,9 @@ async fn process_gateway_event(shard: &std::sync::Arc<Shard>, msg: GatewayReceiv
     // If this function was called, we're definitely connected to the shard and can rely on that
     // for the duration of this function
     let connection = &mut *shard.connection.lock().await;
+
+    let s = format!("{:?}", msg);
+    log::info!("received {}", &s[..s.len().min(200)]);
 
     match msg {
         GatewayReceiveEvent::Dispatch(Dispatch { event_type, event_data, seq }) => {
@@ -201,8 +231,8 @@ async fn process_gateway_event(shard: &std::sync::Arc<Shard>, msg: GatewayReceiv
         GatewayReceiveEvent::Hello(Hello { heartbeat_interval }) => {
             let is_resuming = match *shard.state.lock() {
                 ConnectionState::WaitingForHello => false,
-                ConnectionState::WaitingForHelloToResume => true,
-                ConnectionState::Connected | ConnectionState::WaitingForResumedAck => {
+                ConnectionState::WaitingForResumed => true,
+                ConnectionState::Connected => {
                     log::warn!("ignoring unexpected Hello event");
                     return;
                 }
@@ -241,20 +271,22 @@ async fn process_gateway_event(shard: &std::sync::Arc<Shard>, msg: GatewayReceiv
                 log::warn!("a heartbeat task was already running and has been overwritten");
             }
 
-            let event = if is_resuming {
-                GatewaySendEvent::Resume(Resume {
+            if !is_resuming {
+                let event = GatewaySendEvent::Identify(Identify {
                     token: shard.options.token.clone(),
-                    session_id: shard.session_id.lock().clone().unwrap(),
-                    seq: *connection.last_seq_number.lock(),
-                })
+                    properties: shard.options.identify_properties.clone(),
+                    intents: shard.options.intents,
+                });
+                connection.send(event).await;
             } else {
-                GatewaySendEvent::Identify(Identify {
-                    token: shard.options.token.clone(),
-                    properties: IdentifyProperties { os: "a", browser: "b", device: "c" },
-                    intents: 1 << 0 | 1 << 9 | 1 << 15,
-                })
-            };
-            connection.send(event).await;
+                // connection
+                //     .send(GatewaySendEvent::Resume(Resume {
+                //         token: shard.options.token.clone(),
+                //         session_id: shard.session_id.lock().clone().unwrap(),
+                //         seq: *connection.last_seq_number.lock(),
+                //     }))
+                //     .await;
+            }
         }
         GatewayReceiveEvent::Reconnect => {
             reconnect_and_resume(shard, connection).await;
@@ -273,6 +305,38 @@ async fn process_gateway_event(shard: &std::sync::Arc<Shard>, msg: GatewayReceiv
 }
 
 pub async fn run(shard: std::sync::Arc<Shard>) {
+    // REMEMBER
+    let shard2 = shard.clone();
+    tokio::spawn(async move {
+        let shard = shard2;
+
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        log::info!("deliberately sabotaging connection to test resuming");
+        shard
+            .connection
+            .lock()
+            .await
+            // .sender
+            // .lock()
+            // .await
+            // .send(tungstenite::Message::Close(Some(tungstenite::protocol::CloseFrame {
+            //     reason: "".into(),
+            //     code: 1000.into(),
+            // })))
+            // .await
+            // .unwrap();
+            .send(GatewaySendEvent::Identify(Identify {
+                intents: 0,
+                properties: IdentifyProperties {
+                    os: "".into(),
+                    browser: "".into(),
+                    device: "".into(),
+                },
+                token: "".into(),
+            }))
+            .await;
+    });
+
     loop {
         tokio::select! {
             command = async {
@@ -291,15 +355,26 @@ pub async fn run(shard: std::sync::Arc<Shard>) {
             } => match msg {
                 Some(Ok(msg)) => match msg {
                     tungstenite::Message::Text(msg) => {
-                        process_gateway_event(&shard, serde_json::from_str(&msg).unwrap()).await
+                        match serde_json::from_str(&msg) {
+                            Ok(msg) => process_gateway_event(&shard, msg).await,
+                            Err(e) => log::warn!("failed to deserialize websocket message: {}", e),
+                        }
                     },
-                    other => println!("other message: {:?}", other),
+                    tungstenite::Message::Close(close_frame) => {
+                        log::info!("received close frame, reconnecting: {:?}", close_frame);
+                        reconnect_and_resume(&shard, &mut *shard.connection.lock().await).await;
+                    }
+                    other => log::info!("received other: {:?}", other),
                 },
-                Some(Err(e)) => log::warn!("shard error: {}", e),
-                None => {
-                    log::warn!("websocket stream exhausted, stopping shard");
-                    break;
-                },
+                other => {
+                    log::warn!("either error or end of stream; either way we are gonna reconnect");
+                    reconnect_and_resume(&shard, &mut *shard.connection.lock().await).await;
+                }
+                // Some(Err(e)) => log::warn!("shard error: {}", e),
+                // None => {
+                //     log::warn!("websocket stream exhausted, stopping shard");
+                //     break;
+                // },
             }
         }
     }
